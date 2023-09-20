@@ -4,6 +4,10 @@
 
 🤖 See the metadata record for this dataset here: https://doi.org/10.21966/g9wr-vs33
 
+Recommended citation for this data record:
+
+Kuznetsova, N., Somov, A., & Pakhomov, E. (2022). Juday Net Zooplankton Data from the 2020 Gulf of Alaska International Year of the Salmon Expedition [Data set]. North Pacific Anadromous Fish Commission. https://doi.org/10.21966/g9wr-vs33
+
 🐟 The repository is structured as follows: 
   * `original_data` contains processed data files that have been sent to the IYS Data Scientists that have not been formatted to the IYS Data Template.
   * `standardized_data` contains the standardized data tables as they will be published to OBIS or ERDDAP. 
