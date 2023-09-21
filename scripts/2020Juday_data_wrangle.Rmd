@@ -1,0 +1,419 @@
+---
+title: "GoA 2020 Juday"
+author: "Tim van der Stap"
+date: "12/14/2021"
+output: html_document
+---
+
+Load the packages used throughout the script:
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+library(tidyverse)
+library(lubridate)
+library(worrms)
+library(dplyr)
+library(obistools)
+library(readxl)
+library(parsedate)
+library(googledrive)
+library(here)
+library(stringi)
+library(purrr)
+```
+
+Describe the functions used throughout the script:
+
+``` {r functions, eval=FALSE}
+extract_codes <- function(x) {
+  stri_match_all_regex(x, "\\-*\\d+\\.*\\d*") %>% # extract the numbers from the Species names
+    map(~paste0(as.vector(.), collapse="")) # paste them back together
+}
+```
+
+## Getting started
+
+The following line only needs to be run once to download the tidied data from Google Drive to your computer's hard drive, and to read in the excel file. 
+
+
+```{r drive_download}
+drive_download("https://docs.google.com/spreadsheets/d/189nM9XTYulBB9Fr19BjCRNXD_br1pEGa/edit#gid=1213909334", path = here("Zooplankton - Juday", "original_data", "Juday2020.xlsx"), overwrite = TRUE)
+```
+
+Add a sheet for the metadata and fix the date and times.
+
+```{r, eval = FALSE}
+juday2020 <- read_excel(here("Zooplankton - Juday", "original_data", "Juday2020.xlsx"), sheet = "Metadata")
+```
+
+We need to change the time column to properly reflect:
+
+``` {r date_time, eval = FALSE}
+juday2020$Station <- as.character(juday2020$Station)
+juday2020[c(38), "Station"] <- "29-2"
+
+juday2020_metadata <- juday2020 %>%
+  mutate(newTime = format(Time, "%H:%M:%S"),
+         eventDate = format_iso_8601(as.POSIXct(paste(Date, newTime), 
+                                                format = "%Y-%m-%d %H:%M:%S",
+                                                tz = "America/Los_Angeles")),
+         eventDate = str_replace(eventDate, "\\+00:00", "Z"),
+         project = "IYS",
+         cruise = paste(project, "GoA2020", sep = ":"),
+         station = paste(cruise, Station, sep = ":Stn"),
+         cast = paste(station, "juday", sep = ":"))
+
+juday2020_metadata$year <- as.numeric(format(as.Date(juday2020_metadata$eventDate), "%Y"))
+juday2020_metadata$month <- as.numeric(format(as.Date(juday2020_metadata$eventDate), "%m"))
+juday2020_metadata$day <- as.numeric(format(as.Date(juday2020_metadata$eventDate), "%d"))
+```
+
+First we create the Event Core: 
+
+``` {r juday2020_event}
+juday2020_cast <- juday2020_metadata %>%
+  select(eventID = cast,
+         eventDate,
+         year,
+         month,
+         day,
+         decimalLatitude = `Y coord`,
+         decimalLongitude = `X coord`,
+         maximumDepthInMeters = Layer) %>%
+  mutate(minimumDepthInMeters = 0) %>% 
+  distinct(eventID, .keep_all = TRUE) 
+
+juday2020_cast <- juday2020_cast %>%
+         mutate(footprintWKT = paste("POINT"," (", juday2020_cast$decimalLongitude, " ", 
+                                     juday2020_cast$decimalLatitude, ")"))
+
+coordinates <- obistools::calculate_centroid(juday2020_cast$footprintWKT) %>% select(coordinateUncertaintyInMeters)
+juday2020_event <- cbind(juday2020_cast, coordinates) %>% mutate(geodeticDatum = "WGS84")
+
+# Remove any NAs from the Event Core:
+juday2020_event <- as.data.frame(juday2020_event)
+juday2020_event[is.na(juday2020_event)] <- ""
+
+# Make sure the folder path exists already (e.g. ./Bongo/tidy_data)
+write_csv(juday2020_event, here("Zooplankton - Juday", "tidy_data", "juday2020_event.csv"))
+```
+
+Next, we create the Occurrence extension. In the datasheet, data for large, medium and small size fractions are all included in the same datasheet. This information needs to be parsed out first before it is useful. For this reason, we have to ensure that we subset properly before standardizing. We create three separate occurrence tables, one for each size fraction, and then combine these into a single Occurrence extension table.
+
+First the large size fraction:
+
+``` {r size_fraction_large, eval = FALSE}
+juday2020_large <- read_excel(here("Zooplankton - Juday", "original_data", "Juday2020.xlsx"), sheet = "Biomass(mg)", skip = 1)
+
+# Select only the top 38 rows, which include the data for the large size fraction:
+juday2020_large <- juday2020_large[c(1:38),]
+juday2020_large[c(38), "Station"] <- "29-2"
+juday2020_large <- juday2020_large %>% select(3, 13:176) %>% as.data.frame() # Select only Station column + data columns.
+
+# Next, we pivot the data frame into a long format:
+juday2020_large_lf <- juday2020_large %>%
+  mutate_all(as.character) %>% pivot_longer(., cols = !Station, names_to = "Species", values_to = "Biomass")
+
+# Recreate the eventID information, which will allow us to nest the occurrence information under the Event Core. 
+juday2020_large_lf <- juday2020_large_lf %>% 
+  mutate(project = "IYS",
+         cruise = paste(project, "GoA2020", sep = ":"),
+         station = paste(cruise, Station, sep = ":Stn"),
+         cast = paste(station, "juday", sep = ":"))
+
+# A few filters to apply: 1) Filter out where biomass = 0 (i.e. species is absent); 2) filter out "total" data columns
+juday2020_large_lf <- juday2020_large_lf %>% filter(Biomass != 0) %>% filter(!grepl("Total|total|...176", Species))
+juday2020_large_lf$Species <- as.character(juday2020_large_lf$Species)
+
+# Extract the numbers from the Species names and include these in a separate column 'size_range', and remove from Species column:
+juday2020_large_lf <- juday2020_large_lf %>% mutate(size_range=extract_codes(Species))
+juday2020_large_lf$Species <- gsub("\\-*\\d+\\.*\\d*", "", juday2020_large_lf$Species)
+
+## There are observations of 'Flaccisagitta maxima .>' where the size_range currently is 40. This needs to be changed to: Species = 	Flaccisagitta maxima, with size_range of > 40. 
+juday2020_large_lf$size_range <- gsub("^40", ">40", juday2020_large_lf$size_range)
+```
+
+Clean up species names, following these three steps:
+
+Step 1: For all observations that include 'sp.', this has to be replaced by including 'sp. indet' in a separate column, and then remove the sp. from the Species name column
+Step 2: Punctuations in the species names needs to be removed, i.e. remove brackets, any remaining commas etc.
+Step 3: Lifestages need to be extracted and included in a separate column, and then removed from the Species column. 
+
+```{r species_names_clean, eval=FALSE}
+# Step 1:
+juday2020_large_lf <- juday2020_large_lf %>% 
+  mutate(identificationQualifier = ifelse(grepl("sp.", juday2020_large_lf$Species), "sp. indet", ""))
+juday2020_large_lf$Species <- gsub("\\b sp. \\b", "", juday2020_large_lf$Species)
+
+# Step 2: 
+juday2020_large_lf$Species <- gsub('[[:punct:]]+','', juday2020_large_lf$Species)
+
+# Step 3:
+juday2020_large_lf <- juday2020_large_lf %>%
+  mutate(lifeStage = ifelse(grepl("larvae|Larvae", Species), "larvae", ""),
+         lifeStage = ifelse(grepl("furcilia", Species), "furcilia", lifeStage),
+         lifeStage = ifelse(grepl("caliptopis", Species), "caliptopis", lifeStage),
+         lifeStage = ifelse(grepl("Ova", Species), "eggs", lifeStage))
+
+juday2020_large_lf$Species <- gsub("Ova |furcilia|larvae|Larvae |caliptopis", "", juday2020_large_lf$Species)
+
+# Trim white spaces at the end of the species names:
+juday2020_large_lf$Species <- stringr::str_trim(juday2020_large_lf$Species, side = "right")
+unique_spp_large <- unique(juday2020_large_lf$Species) %>% as.data.frame()
+colnames(unique_spp_large) <- "scientificname"
+
+# Assign WoRMS LSID to the unique species:
+juday2020_large_lf <- juday2020_large_lf %>% rename(scientificname = Species)
+worms_id <- worrms::wm_records_names(unique(juday2020_large_lf$scientificname), marine_only = FALSE) %>% dplyr::bind_rows()
+
+# Find out which species are not found in the WoRMS database:
+worms_juday2020_large <- left_join(unique_spp_large, worms_id, by = "scientificname") %>% 
+  filter(is.na(AphiaID)) %>% distinct(scientificname)
+
+# These species will need to have their names changed in the original dataframe juday2020_large_lf which we'll do below. I write this out so it is clear which names or species observations have been altered, so this can be verified. 
+juday2020_large_lf$scientificname <- gsub("Decapoda shrims", "Decapoda", juday2020_large_lf$scientificname)
+juday2020_large_lf$scientificname <- gsub("Медузы", "Cnidaria", juday2020_large_lf$scientificname)
+juday2020_large_lf$scientificname <- gsub("Amollotrix", "Amallothrix", juday2020_large_lf$scientificname)
+juday2020_large_lf$scientificname <- gsub("Flaccisagitta maxima", "Pseudosagitta maxima", juday2020_large_lf$scientificname)
+juday2020_large_lf$scientificname <- gsub("Doliolium", "Doliolum", juday2020_large_lf$scientificname)
+juday2020_large_lf$scientificname <- gsub("pisces", "Pisces", juday2020_large_lf$scientificname)
+juday2020_large_lf$scientificname <- gsub("Carinaria cristatus", "Carinaria cristata", juday2020_large_lf$scientificname)
+juday2020_large_lf$scientificname <- gsub("Pareuchaeta japonica", "Paraeuchaeta japonica", juday2020_large_lf$scientificname)
+
+# So now we can run worrms::wm_records_names again, and there should be no NA in the AphiaID column.   
+juday2020_large_worms_id <- worrms::wm_records_names(unique(juday2020_large_lf$scientificname), marine_only = FALSE) %>% bind_rows() 
+
+# Omit certain AphiaIDs that do not apply:
+juday2020_large_worms_id <- juday2020_large_worms_id %>% filter(!AphiaID %in% c("254409", "602637", "603038", "601567"))
+
+# Now that all unique entries have a WoRMS ID, connect this to the original data frame:
+juday2020_occ_large <- left_join(juday2020_large_lf, juday2020_large_worms_id, by = "scientificname")
+
+# Omit biomass data from the occurrence extension:
+juday2020_occ_large <- juday2020_occ_large %>%
+  mutate(specificEpithet = stringr::word(scientificname, 2)) %>%
+  select(eventID = cast, lifeStage, scientificname, identificationQualifier, kingdom,
+         phylum, class, order, family, genus, specificEpithet, lsid, authority, rank, status) %>% distinct()
+```
+
+We follow a similar structure to obtain the occurrences in the medium and small size fractions, and then eventually we combine these occurrence tables into a single Occurrence extension. 
+
+``` {r size_fraction_medium, eval = FALSE}
+juday2020_medium <- read_excel(here("Zooplankton - Juday", "original_data", "Juday2020.xlsx"), sheet = "Biomass(mg)", skip = 42)
+
+# Select only the top 38 rows, which include the data for the medium size fraction:
+juday2020_medium <- juday2020_medium[c(1:38),]
+juday2020_medium[c(38), "Station"] <- "29-2"
+juday2020_medium <- juday2020_medium %>% select(3, 13:78) %>% as.data.frame()
+
+# Next, we pivot the data frame into a long format (lf):
+juday2020_medium_lf <- juday2020_medium %>%
+  mutate_all(as.character) %>% pivot_longer(., cols = !Station, names_to = "Species", values_to = "Biomass")
+
+# Include the eventID information:
+juday2020_medium_lf <- juday2020_medium_lf %>% 
+  mutate(project = "IYS",
+         cruise = paste(project, "GoA2020", sep = ":"),
+         station = paste(cruise, Station, sep = ":Stn"),
+         cast = paste(station, "juday", sep = ":"))
+
+# A few filters to apply: 1) Filter out where biomass = 0 (i.e. species is absent); 2) filter out "total" observation columns
+juday2020_medium_lf <- juday2020_medium_lf %>% filter(Biomass != 0) %>% filter(!grepl("Total|total", Species))
+juday2020_medium_lf$Species <- as.character(juday2020_medium_lf$Species)
+
+# Extract the numbers from the Species names and include these in a separate column 'size_range', and remove from Species column:
+juday2020_medium_lf <- juday2020_medium_lf %>% mutate(size_range=extract_codes(Species))
+juday2020_medium_lf$Species <- gsub("\\-*\\d+\\.*\\d*", "", juday2020_medium_lf$Species)
+
+# The next steps are to clean up the Species column:
+# Step 1: For all observations that include 'sp.', this has to be replaced by including 'sp. indet' in a separate column, and then remove the sp. from the Species name column
+# Step 2: Punctuation in the species names needs to be removed, i.e. remove brackets, any remaining commas etc.
+# Step 3: Lifestages need to be extracted and included in a separate column, and then removed from the Species column. 
+
+# Step 1:
+juday2020_medium_lf <- juday2020_medium_lf %>% 
+  mutate(identificationQualifier = ifelse(grepl("sp.", juday2020_medium_lf$Species), "sp. indet", ""))
+juday2020_medium_lf$Species <- gsub("\\b sp. \\b", "", juday2020_medium_lf$Species)
+
+# Step 2: 
+juday2020_medium_lf$Species <- gsub('[[:punct:]]+','', juday2020_medium_lf$Species)
+
+# Step 3:
+juday2020_medium_lf <- juday2020_medium_lf %>%
+  mutate(lifeStage = ifelse(grepl("larvae", Species), "larvae", ""),
+         lifeStage = ifelse(grepl("furcilia", Species), "furcilia", lifeStage),
+         lifeStage = ifelse(grepl("caliptopis", Species), "caliptopis", lifeStage),
+         lifeStage = ifelse(grepl("Ova", Species), "eggs", lifeStage),
+         lifeStage = ifelse(grepl("Zoea", Species), "zoea", lifeStage),
+         lifeStage = ifelse(grepl("naup I", Species), "nauplius", lifeStage))
+
+# Remove the lifeStages from the Species column:
+juday2020_medium_lf$Species <- gsub("Ova |furcilia|larvae|caliptopis|Zoea |naup I", "", juday2020_medium_lf$Species)
+
+# Trim white spaces at the end of the species names:
+juday2020_medium_lf$Species <- stringr::str_trim(juday2020_medium_lf$Species, side = "right")
+unique_spp_medium <- unique(juday2020_medium_lf$Species) %>% as.data.frame()
+colnames(unique_spp_medium) <- "scientificname"
+
+# Assign WoRMS LSID to the unique species:
+juday2020_medium_lf <- juday2020_medium_lf %>% rename(scientificname = Species)
+worms_id <- worrms::wm_records_names(unique(juday2020_medium_lf$scientificname), marine_only = FALSE) %>% dplyr::bind_rows()
+
+# Find out which species are not found in the WoRMS database:
+worms_juday2020_medium <- left_join(unique_spp_medium, worms_id, by = "scientificname") %>% 
+  filter(is.na(AphiaID)) %>% distinct(scientificname)
+
+# These species will need to have their names changed in the original dataframe juday2020_medium_lf which we'll do below. I write this out so it is clear which names or species observations have been altered, so this can be verified. 
+juday2020_medium_lf$scientificname <- gsub("Amollotrix", "Amallothrix", juday2020_medium_lf$scientificname)
+juday2020_medium_lf$scientificname <- gsub("Doliolium", "Doliolum", juday2020_medium_lf$scientificname)
+juday2020_medium_lf$scientificname <- gsub("Pareuchaeta japonica", "Paraeuchaeta japonica", juday2020_medium_lf$scientificname)
+juday2020_medium_lf$scientificname <- gsub("Acartia clausi omori", "Acartia clausi", juday2020_medium_lf$scientificname) # A. omorii?
+juday2020_medium_lf$scientificname <- gsub("Копеподиты Candacia", "Candacia", juday2020_medium_lf$scientificname)
+juday2020_medium_lf$scientificname <- gsub("Pseudocalanus копеп", "Pseudocalanus", juday2020_medium_lf$scientificname)
+
+# Trim trailing whitespace:
+juday2020_medium_lf$scientificname <- trimws(juday2020_medium_lf$scientificname, which = "right")
+
+# Omit неопр species - unknown species:.
+juday2020_medium_lf <- juday2020_medium_lf %>% filter(scientificname != "неопр")
+
+# So now we can run worrms::wm_records_names again, and there should be no NA in the AphiaID column.   
+juday2020_medium_worms_id <- worrms::wm_records_names(unique(juday2020_medium_lf$scientificname), marine_only = FALSE) %>% bind_rows() 
+
+# Some scientificnames return multiple AphiaIDs, i.e. for both marine and non-marine taxa. Ensure that the correct ones are removed:
+juday2020_medium_worms_id <- juday2020_medium_worms_id %>% filter(!AphiaID %in% c("603038", "892593", "601567"))
+
+# Now that all unique entries have a WoRMS ID, connect this to the original data frame:
+juday2020_occ_medium <- left_join(juday2020_medium_lf, juday2020_medium_worms_id, by = "scientificname")
+juday2020_occ_medium <- juday2020_occ_medium %>%
+  mutate(specificEpithet = stringr::word(scientificname, 2)) %>%
+  select(eventID = cast, lifeStage, scientificname, identificationQualifier, kingdom,
+         phylum, class, order, family, genus, specificEpithet, lsid, authority, rank, status)
+```
+
+And for the small size fractions: 
+
+```{r size_fraction_small, eval = FALSE}
+juday2020_small <- read_excel(here("Zooplankton - Juday", "original_data", "Juday2020.xlsx"), sheet = "Biomass(mg)", skip = 84)
+
+# Select only the top 38 rows, which include the data for the medium size fraction:
+juday2020_small <- juday2020_small %>% select(3, 13:84) %>% as.data.frame()
+juday2020_small[c(38), "Station"] <- "29-2"
+
+# Next, we pivot the data frame into a long format (lf):
+juday2020_small_lf <- juday2020_small %>%
+  mutate_all(as.character) %>% pivot_longer(., cols = !Station, names_to = "Species", values_to = "Biomass")
+
+# Include the eventID information:
+juday2020_small_lf <- juday2020_small_lf %>% 
+  mutate(project = "IYS",
+         cruise = paste(project, "GoA2020", sep = ":"),
+         station = paste(cruise, Station, sep = ":Stn"),
+         cast = paste(station, "juday", sep = ":"))
+
+# A few filters to apply: 1) Filter out where biomass = 0 (i.e. species is absent); 2) filter out "total" observation columns
+juday2020_small_lf <- juday2020_small_lf %>% filter(Biomass != 0) %>% filter(!grepl("total", Species))
+juday2020_small_lf$Species <- as.character(juday2020_small_lf$Species)
+
+# For the small size fraction we first have to create a column for lifeStages and subsequently remove lifestages from the Species column. The reason for this is that there are lifestages for e.g. Copepoda that are documented as '1-2', which with the original code would get interpreted as a size range. 
+
+juday2020_small_lf$Species <- gsub("Копеподиты 1-2 стадии", "Copepoda 1-2 stages", juday2020_small_lf$Species)
+
+# Step 1:
+juday2020_small_lf <- juday2020_small_lf %>% 
+  mutate(identificationQualifier = ifelse(grepl("sp.", juday2020_small_lf$Species), "sp. indet", ""))
+juday2020_small_lf$Species <- gsub("\\b sp. \\b", "", juday2020_small_lf$Species)
+
+juday2020_small_lf <- juday2020_small_lf %>%
+  mutate(lifeStage = ifelse(grepl("larvae", Species), "larvae", ""),
+         lifeStage = ifelse(grepl("juv.", Species), "juvenile", lifeStage),
+         lifeStage = ifelse(grepl("caliptopis", Species), "caliptopis", lifeStage),
+         lifeStage = ifelse(grepl("Ova |ova ", Species), "eggs", lifeStage),
+         lifeStage = ifelse(grepl("Veliger", Species), "veliger", lifeStage),
+         lifeStage = ifelse(grepl("nauplius|nauplii", Species), "nauplius", lifeStage),
+         lifeStage = ifelse(grepl("1-2 stages", Species), "CI/CII", lifeStage))
+
+# Remove the lifeStages from the Species column:
+juday2020_small_lf$Species <- gsub("Ova |ova |larvae|caliptopis|Veliger |nauplius|nauplii|juv.|1-2 stages", 
+                                   "", juday2020_small_lf$Species)
+
+# Extract the numbers from the Species names and include these in a separate column 'size_range', and remove from Species column:
+juday2020_small_lf <- juday2020_small_lf %>% mutate(size_range=extract_codes(Species))
+juday2020_small_lf$Species <- gsub("\\-*\\d+\\.*\\d*", "", juday2020_small_lf$Species)
+
+# Step 2: 
+juday2020_small_lf$Species <- gsub('[[:punct:]]+','', juday2020_small_lf$Species)
+
+# Trim white spaces at the end of the species names:
+juday2020_small_lf$Species <- stringr::str_trim(juday2020_small_lf$Species, side = "right")
+unique_spp_small <- unique(juday2020_small_lf$Species) %>% as.data.frame()
+colnames(unique_spp_small) <- "scientificname"
+
+# Assign WoRMS LSID to the unique species:
+juday2020_small_lf <- juday2020_small_lf %>% rename(scientificname = Species)
+worms_id <- worrms::wm_records_names(unique(juday2020_small_lf$scientificname), marine_only = FALSE) %>% dplyr::bind_rows()
+
+# Find out which species are not found in the WoRMS database:
+worms_juday2020_small <- left_join(unique_spp_small, worms_id, by = "scientificname") %>% 
+  filter(is.na(AphiaID)) %>% distinct(scientificname)
+
+# These species will need to have their names changed in the original dataframe juday2020_medium_lf which we'll do below. I write this out so it is clear which names or species observations have been altered, so this can be verified. 
+juday2020_small_lf$scientificname <- gsub("Doliolium", "Doliolum", juday2020_small_lf$scientificname)
+juday2020_small_lf$scientificname <- gsub("Acartia clausiomori", "Acartia clausi", juday2020_small_lf$scientificname) # A. omorii?
+juday2020_small_lf$scientificname <- gsub("pisces", "Pisces", juday2020_small_lf$scientificname)
+juday2020_small_lf$scientificname <- gsub("Calocalanus tenius", "Calocalanus tenuis", juday2020_small_lf$scientificname)
+juday2020_small_lf$scientificname <- gsub("Копеподиты  стадии", "Copepoda", juday2020_small_lf$scientificname)
+juday2020_small_lf$scientificname <- gsub("Копеп Metridia", "Metridia", juday2020_small_lf$scientificname)
+juday2020_small_lf$scientificname <- gsub("Копеподиты Calanus", "Calanus", juday2020_small_lf$scientificname)
+juday2020_small_lf$scientificname <- gsub("Копеп Neocalanus", "Neocalanus", juday2020_small_lf$scientificname)
+juday2020_small_lf$scientificname <- gsub("Медузы", "Cnidaria", juday2020_small_lf$scientificname)
+juday2020_small_lf$scientificname <- gsub("Pseudocalanus копеп", "Pseudocalanus", juday2020_small_lf$scientificname)
+
+# So now we can run worrms::wm_records_names again, and there should be no NA in the AphiaID column.   
+juday2020_small_worms_id <- worrms::wm_records_names(unique(juday2020_small_lf$scientificname), marine_only = FALSE) %>% bind_rows() 
+
+# Some scientificnames return multiple AphiaIDs, i.e. for both marine and non-marine taxa. Ensure that the correct ones are removed:
+juday2020_small_worms_id <- juday2020_small_worms_id %>% filter(!AphiaID %in% c("999078", "892593", "322599"))
+
+# Now that all unique entries have a WoRMS ID, connect this to the original data frame:
+juday2020_occ_small <- left_join(juday2020_small_lf, juday2020_small_worms_id, by = "scientificname")
+juday2020_occ_small <- juday2020_occ_small %>%
+  mutate(specificEpithet = stringr::word(scientificname, 2)) %>%
+  select(eventID = cast, lifeStage, scientificname, identificationQualifier, kingdom,
+         phylum, class, order, family, genus, specificEpithet, lsid, authority, rank, status)
+```
+
+Finally, we combine the times into a single Occurrence extension:
+
+``` {r juday2020 occ, eval = FALSE}
+juday2020_occ_fnl <- rbind(juday2020_occ_large, juday2020_occ_medium, juday2020_occ_small) %>%
+  rename(scientificName = scientificname,
+         scientificNameID = lsid,
+         scientificNameAuthorship = authority,
+         taxonomicStatus = status,
+         taxonRank = rank) %>%
+  mutate(basisOfRecord = "PreservedSpecimen")
+
+# Right now we are only interested in species occurrences (presence/absence) at a station, so any duplicates in species occurrences across the size fractions can be removed before we create occurrenceIDs:
+juday2020_occ_fnl <- juday2020_occ_fnl %>% distinct()
+
+# Create occurrenceID and include occurrenceStatus:
+juday2020_occ_fnl <- juday2020_occ_fnl %>% 
+  group_by(eventID) %>%
+  mutate(id = seq_along(eventID),
+         occurrenceID = paste(eventID, id, sep = ":zoop_occ:"),
+         occurrenceStatus = "present") %>%
+  select(-id)
+
+# To re-order the occurrenceID, use following code:
+order <- stringr::str_sort(juday2020_occ_fnl$occurrenceID, numeric=TRUE)
+juday2020_occ_fnl <- juday2020_occ_fnl[match(order, juday2020_occ_fnl$occurrenceID),]
+
+col_order <- c("eventID", "occurrenceID", "occurrenceStatus", "scientificName", "scientificNameID", "lifeStage", "identificationQualifier", "scientificNameAuthorship", "taxonRank", "taxonomicStatus", "kingdom", "phylum", "class", "order", "family", "genus", "specificEpithet", "basisOfRecord")
+juday2020_occ_fnl <- juday2020_occ_fnl[, col_order]
+
+# Make sure the folder path exists already (e.g. ./Bongo/tidy_data)
+write_csv(juday2020_occ_fnl, here("Zooplankton - Juday", "tidy_data", "juday2020_occurrence.csv"))
+```
+
+
